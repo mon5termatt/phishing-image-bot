@@ -44,6 +44,7 @@ PUBLIC_HASHES_URL = os.getenv(
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 HASH_DISTANCE_THRESHOLD = 8
 MAX_TIMEOUT_SECONDS = 2_419_200  # Discord cap: 28 days
+MAX_IMAGE_BYTES = 32 * 1024 * 1024  # don't hash absurdly large files
 MOD_PERMS = discord.Permissions(manage_messages=True)
 INVITE_PERMISSIONS = discord.Permissions(
     view_channel=True,
@@ -217,7 +218,10 @@ class Storage:
 
     def guild(self, guild_id: int) -> dict:
         stored = self._guilds.get(str(guild_id), {})
-        return {**GUILD_DEFAULTS, **stored}
+        merged = {**GUILD_DEFAULTS, **stored}
+        # Copy the list so callers can never mutate stored data (or the defaults).
+        merged["hashes"] = list(merged["hashes"])
+        return merged
 
     async def update(self, guild_id: int, **values) -> None:
         unknown = set(values) - set(GUILD_DEFAULTS)
@@ -286,7 +290,7 @@ class PhishingImageBot(discord.Client):
         self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
         self.tree.add_command(imgcheck)
         self.tree.on_error = self.on_app_command_error
 
@@ -338,6 +342,15 @@ class PhishingImageBot(discord.Client):
         if not collect_scan_targets(message):
             return
         await process_message(self, message)
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        # Link embeds often resolve *after* the original message event — Discord
+        # dispatches that as an edit. Rescan only when new embeds appeared.
+        if not after.guild or after.author.bot or not self.intents.message_content:
+            return
+        if len(after.embeds) <= len(before.embeds):
+            return
+        await process_message(self, after)
 
 
 bot = PhishingImageBot()
@@ -445,8 +458,24 @@ async def resolve_member(
         return cached
     try:
         return await guild.fetch_member(author.id)
-    except discord.NotFound:
+    except discord.HTTPException:
         return None
+
+
+def channel_permission_issues(channel: discord.TextChannel) -> list[str]:
+    """Permissions the bot is missing to post detection embeds in a channel."""
+    me = channel.guild.me
+    if me is None:
+        return []
+    perms = channel.permissions_for(me)
+    missing: list[str] = []
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.embed_links:
+        missing.append("Embed Links")
+    if not perms.attach_files:
+        missing.append("Attach Files")
+    return missing
 
 
 async def process_message(client: PhishingImageBot, message: discord.Message) -> None:
@@ -493,6 +522,19 @@ async def process_message(client: PhishingImageBot, message: discord.Message) ->
     for target in scan_targets:
         try:
             image_bytes = await target.read()
+            if len(image_bytes) > MAX_IMAGE_BYTES:
+                await log_debug(
+                    guild,
+                    settings,
+                    "Skipped item",
+                    (
+                        f"Message ID: `{message.id}`\n"
+                        f"Item: `{target.label}` is {len(image_bytes) // (1024 * 1024)} MiB "
+                        f"(limit {MAX_IMAGE_BYTES // (1024 * 1024)} MiB)."
+                    ),
+                    color=discord.Color.light_grey(),
+                )
+                continue
             incoming_hash = await hash_image_bytes(image_bytes)
 
             matched_hash: imagehash.ImageHash | None = None
@@ -829,7 +871,11 @@ async def setup_cmd(
                 "Re-run with `channel:` or grant the permission."
             )
     else:
-        lines.append(f"**Log channel:** {channel.mention}")
+        line = f"**Log channel:** {channel.mention}"
+        missing = channel_permission_issues(channel)
+        if missing:
+            line += f" — ⚠️ missing **{', '.join(missing)}** there"
+        lines.append(line)
 
     if channel is not None:
         await store.update(guild.id, log_channel_id=channel.id)
@@ -908,17 +954,20 @@ async def setchannel(
         return
 
     await store.update(interaction.guild.id, log_channel_id=channel.id)
-    await interaction.response.send_message(
+    reply = (
         f"Log channel set to {channel.mention}. "
-        "Detection alerts (and debug embeds when enabled) will post there.",
-        ephemeral=True,
+        "Detection alerts (and debug embeds when enabled) will post there."
     )
+    missing = channel_permission_issues(channel)
+    if missing:
+        reply += f"\n⚠️ I'm missing **{', '.join(missing)}** in that channel — alerts may fail."
+    await interaction.response.send_message(reply, ephemeral=True)
 
 
 @imgcheck.command(name="setpunish", description="Set punishment on detection.")
 @app_commands.describe(
     action="Punishment to apply when a match is found.",
-    duration="Timeout duration, e.g. 1h, 30m, 1d. Leave empty for permanent ban.",
+    duration="Timeout length, e.g. 1h, 30m, 1d (max 28d). Ignored for ban; empty = 28 days.",
 )
 async def setpunish(
     interaction: discord.Interaction,
@@ -928,7 +977,11 @@ async def setpunish(
     assert interaction.guild is not None
 
     seconds = 0
-    if duration:
+    note = ""
+    if action == "ban":
+        if duration:
+            note = " (bans are always permanent; duration ignored)"
+    elif duration:
         parsed = parse_timedelta(duration)
         if parsed is None:
             await interaction.response.send_message(
@@ -937,11 +990,19 @@ async def setpunish(
             )
             return
         seconds = int(parsed.total_seconds())
+        if seconds > MAX_TIMEOUT_SECONDS:
+            seconds = MAX_TIMEOUT_SECONDS
+            note = " (capped at Discord's 28-day timeout limit)"
 
     await store.update(interaction.guild.id, punish_action=action, punish_duration=seconds)
-    time_msg = f"for {duration}" if duration else "permanently"
+    if action == "ban":
+        time_msg = "permanently"
+    elif seconds > 0:
+        time_msg = f"for {humanize_timedelta(timedelta(seconds=seconds))}"
+    else:
+        time_msg = "for 28 days (default)"
     await interaction.response.send_message(
-        f"Punishment set to **{action}** {time_msg}.", ephemeral=True
+        f"Punishment set to **{action}** {time_msg}.{note}", ephemeral=True
     )
 
 
@@ -980,26 +1041,28 @@ async def debug(interaction: discord.Interaction, enabled: bool) -> None:
 async def settings_cmd(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
     data = store.guild(interaction.guild.id)
-    duration_str = (
-        humanize_timedelta(timedelta(seconds=data["punish_duration"]))
-        if data["punish_duration"] > 0
-        else "Permanent"
-    )
+    if data["punish_action"] == "ban":
+        punish_text = "ban (permanent)"
+    elif data["punish_duration"] > 0:
+        punish_text = f"timeout ({humanize_timedelta(timedelta(seconds=data['punish_duration']))})"
+    else:
+        punish_text = "timeout (28 days, default)"
     channel_text = (
         f"<#{data['log_channel_id']}>"
         if data["log_channel_id"]
-        else "Not set — `/imgcheck setchannel`"
+        else "Not set — `/imgcheck setchannel` or `/imgcheck setup`"
     )
-
-    await interaction.response.send_message(
-        f"**Punishment:** {data['punish_action']}\n"
-        f"**Duration:** {duration_str}\n"
-        f"**Dry-run:** {'enabled' if data['dry_run'] else 'disabled'}\n"
-        f"**Debug logging:** {'enabled' if data['debug'] else 'disabled'}\n"
-        f"**Log channel:** {channel_text}\n"
+    lines = [
+        f"**Punishment:** {punish_text}",
+        f"**Dry-run:** {'enabled' if data['dry_run'] else 'disabled'}",
+        f"**Debug logging:** {'enabled' if data['debug'] else 'disabled'}",
+        f"**Log channel:** {channel_text}",
         f"**Blocklist size:** {len(data['hashes'])}",
-        ephemeral=True,
-    )
+        f"**Community list:** <{PUBLIC_HASHES_URL}>",
+    ]
+    if not message_content_enabled():
+        lines.append("⚠️ `ENABLE_MESSAGE_CONTENT` is off — automatic scanning is inactive.")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @imgcheck.command(name="showhashes", description="Show currently stored image hashes.")
@@ -1158,9 +1221,9 @@ async def synchashes(interaction: discord.Interaction, removal: bool = False) ->
     )
 
 
-@imgcheck.command(name="testmessage", description="Re-scan a message by ID for debugging.")
+@imgcheck.command(name="testmessage", description="Re-scan a message by ID or link for debugging.")
 @app_commands.describe(
-    message_id="The message ID to scan.",
+    message_id="The message ID (or a full message link) to scan.",
     channel="Channel containing the message. Defaults to the current channel.",
 )
 async def testmessage(
@@ -1168,7 +1231,24 @@ async def testmessage(
     message_id: str,
     channel: discord.TextChannel | None = None,
 ) -> None:
-    assert interaction.guild is not None
+    guild = interaction.guild
+    assert guild is not None
+
+    # Accept a full message link (https://discord.com/channels/g/c/m) as well as a bare ID.
+    raw = message_id.strip()
+    if "/" in raw:
+        parts = [part for part in raw.split("/") if part]
+        if len(parts) >= 3 and parts[-2].isdigit():
+            found = guild.get_channel(int(parts[-2]))
+            if isinstance(found, discord.TextChannel):
+                channel = found
+        raw = parts[-1]
+    if not raw.isdigit():
+        await interaction.response.send_message(
+            "Provide a numeric message ID or a full message link.", ephemeral=True
+        )
+        return
+
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, discord.TextChannel):
         await interaction.response.send_message("Run this in a text channel.", ephemeral=True)
@@ -1176,8 +1256,8 @@ async def testmessage(
 
     await interaction.response.defer(ephemeral=True)
     try:
-        message = await target_channel.fetch_message(int(message_id))
-    except (ValueError, discord.NotFound, discord.Forbidden) as exc:
+        message = await target_channel.fetch_message(int(raw))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
         await interaction.followup.send(f"Could not fetch message: {exc}", ephemeral=True)
         return
 
@@ -1203,7 +1283,23 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    bot.run(token, log_handler=None)
+    try:
+        bot.run(token, log_handler=None)
+    except discord.LoginFailure:
+        print(
+            "Error: Discord rejected the token. Double-check DISCORD_TOKEN in .env "
+            "(Bot page of the Discord Developer Portal → Reset Token).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except discord.PrivilegedIntentsRequired:
+        print(
+            "Error: ENABLE_MESSAGE_CONTENT=true but the Message Content Intent is not "
+            "enabled for this bot. Turn it on in the Discord Developer Portal → Bot → "
+            "Privileged Gateway Intents, or set ENABLE_MESSAGE_CONTENT=false.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

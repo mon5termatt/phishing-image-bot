@@ -8,7 +8,7 @@ A minimal, single-file Discord bot that scans posted images (attachments, embeds
 
 ## How it works
 
-Every image posted is hashed with a perceptual hash (pHash). If it lands within distance **8** of any blocklisted hash, the message is deleted, the configured punishment (timeout or ban) is applied, and a detection embed (user, matched hash, distance, the image) is posted to your log channel. Recompressed, resized, or lightly edited copies still match. Users with mod/admin permissions are immune.
+Every image posted is hashed with a perceptual hash (pHash). If it lands within distance **8** of any blocklisted hash, the message is deleted, the configured punishment (timeout or ban) is applied, and a detection embed (user, matched hash, distance, the image) is posted to your log channel. Recompressed, resized, or lightly edited copies still match. Messages are also rescanned when link embeds resolve after posting, so pasted-link phishing images are caught too. Users with mod/admin permissions are immune.
 
 ## Quick start
 
@@ -56,7 +56,7 @@ All commands are under `/imgcheck` and require **Manage Messages** by default (a
 | `/imgcheck hashcheck` | `image`, … | Show perceptual hashes for uploaded images without blocking them |
 | `/imgcheck dryrun` | `enabled` | Simulate enforcement (log detections, never punish) |
 | `/imgcheck debug` | `enabled` | Verbose scan breadcrumbs to the log channel (default off) |
-| `/imgcheck testmessage` | `message_id`, `channel` | Re-scan an existing message by ID (debug) |
+| `/imgcheck testmessage` | `message_id`, `channel` | Re-scan an existing message by ID or message link (debug) |
 
 ## Contributing hashes
 
